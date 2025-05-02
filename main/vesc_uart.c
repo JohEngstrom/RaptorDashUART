@@ -1,4 +1,5 @@
 
+#include "crc16.h"
 #include <math.h>
 #include "vesc_uart.h"
 #include "driver/uart.h"
@@ -8,6 +9,10 @@
 #define UART_PORT UART_NUM_1
 #define BUF_SIZE 128
 #define POLL_INTERVAL 1000
+
+static int16_t read_int16(const uint8_t *data, int *index);
+static uint16_t read_uint16(const uint8_t *data, int *index);
+static int32_t read_int32(const uint8_t *data, int *index);
 
 static const char *TAG = "VESC_UART";
 static float smoothed_watts = 0;
@@ -34,24 +39,101 @@ void vesc_uart_init(int tx_pin, int rx_pin) {
     uart_set_pin(UART_PORT, tx_pin, rx_pin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
 }
 
-bool vesc_uart_poll(vesc_data_t* data) {
-    uint8_t request[] = {2, 4, 4 ^ 2, 3};
-    uart_write_bytes(UART_PORT, (const char*)request, sizeof(request));
+bool vesc_read_packet(uint8_t *payload_out, size_t *payload_len) {
+    uint8_t buffer[128];
+    int total_read = 0;
 
-    uint8_t d[BUF_SIZE];
-    int len = 0;
-    uint32_t start = xTaskGetTickCount();
-    while (len < 55 && (xTaskGetTickCount() - start) < pdMS_TO_TICKS(POLL_INTERVAL)) {
-        int read = uart_read_bytes(UART_PORT, d + len, BUF_SIZE - len, pdMS_TO_TICKS(100));
-        if (read > 0) len += read;
+    // Wait for start byte
+    while (true) {
+        int read = uart_read_bytes(UART_PORT, buffer, 1, pdMS_TO_TICKS(100));
+        if (read == 1 && buffer[0] == 2) break;
     }
 
-    if (len < 55) return false;
+    // Read length
+    int read = uart_read_bytes(UART_PORT, buffer + 1, 1, pdMS_TO_TICKS(100));
+    if (read != 1) return false;
+    uint8_t len = buffer[1];
 
-    int32_t erpm = (d[0] << 24) | (d[1] << 16) | (d[2] << 8) | d[3];
-    data->current = ((int16_t)((d[4] << 8) | d[5])) / 10.0f;
-    data->voltage = ((uint16_t)((d[6] << 8) | d[7])) / 10.0f;
-    data->mosfet_temp = ((int16_t)((d[8] << 8) | d[9])) / 10.0f;
+    // Read payload + CRC (2 bytes) + end byte
+    int needed = len + 2 + 1;
+    read = uart_read_bytes(UART_PORT, buffer + 2, needed, pdMS_TO_TICKS(200));
+    if (read != needed) return false;
+
+    // Verify end byte
+    if (buffer[2 + len + 2] != 3) return false;
+
+    // Check CRC
+    uint16_t received_crc = ((uint16_t)buffer[2 + len] << 8) | buffer[2 + len + 1];
+    uint16_t computed_crc = crc16(buffer + 2, len);
+
+    if (received_crc != computed_crc) return false;
+
+    // Copy payload out
+    memcpy(payload_out, buffer + 2, len);
+    *payload_len = len;
+    return true;
+}
+
+void vesc_send_command(uint8_t command) {
+    uint8_t payload[1] = {command};
+    uint16_t crc = crc16(payload, 1);
+
+    uint8_t packet[6];
+    packet[0] = 2;              // Start byte (short packet)
+    packet[1] = 1;              // Payload length
+    packet[2] = command;        // Payload: the command
+    packet[3] = (crc >> 8) & 0xFF;  // CRC High byte
+    packet[4] = crc & 0xFF;         // CRC Low byte
+    packet[5] = 3;              // End byte
+
+    uart_write_bytes(UART_PORT, (const char *)packet, sizeof(packet));
+}
+
+bool vesc_uart_poll(vesc_data_t* data) {
+    vesc_send_command(4); // COMM_GET_VALUES
+
+    uint8_t payload[64];
+    size_t payload_len = 0;
+    if (!vesc_read_packet(payload, &payload_len)) return false;
+
+    int i = 0;
+
+    int32_t erpm = read_int32(payload, &i);
+    int16_t motor_current = read_int16(payload, &i);
+    int16_t input_current = read_int16(payload, &i);
+    int16_t duty_cycle = read_int16(payload, &i);
+    uint16_t voltage_raw = read_uint16(payload, &i);
+    int16_t temp_fet = read_int16(payload, &i);
+    int16_t temp_motor = read_int16(payload, &i);
+    i += 2 * 4; // skip current_in, pid_pos, id, iq
+
+    int32_t tachometer = read_int32(payload, &i);
+    int32_t tachometer_abs = read_int32(payload, &i); // unused now
+
+    int32_t wh_consumed = read_int32(payload, &i);
+    int32_t wh_charged = read_int32(payload, &i);
+    int32_t ah_consumed = read_int32(payload, &i);
+    int32_t ah_charged = read_int32(payload, &i);
+
+    uint16_t charge_cycles = read_uint16(payload, &i);
+    uint16_t charged_ah_total_raw = read_uint16(payload, &i);
+
+    // Assign core values
+    data->current = motor_current / 10.0f;
+    data->input_current = input_current / 10.0f;
+    data->duty_cycle_percent = duty_cycle / 10.0f;
+    data->voltage = voltage_raw / 10.0f;
+    data->mosfet_temp = temp_fet / 10.0f;
+    data->motor_temp = temp_motor / 10.0f;
+
+    data->watt_hours = wh_consumed / 1000.0f;
+    data->watt_hours_charged = wh_charged / 1000.0f;
+    data->amp_hours = ah_consumed / 1000.0f;
+    data->amp_hours_charged = ah_charged / 1000.0f;
+    data->charge_cycles = charge_cycles;
+    data->charged_ah_total = charged_ah_total_raw / 100.0f;
+
+    // Derived/calculated metrics
     float watts_now = data->voltage * data->current;
     smoothed_watts += (watts_now - smoothed_watts) / 5.0f;
     if (watts_now > peak_watts) peak_watts = watts_now;
@@ -65,7 +147,6 @@ bool vesc_uart_poll(vesc_data_t* data) {
     data->rpm = erpm / motor_pole_pairs;
     data->speed_kmh = data->rpm * wheel_circum_mm * 60.0f / 1e6f;
 
-    int32_t tachometer = (d[52] << 24) | (d[53] << 16) | (d[54] << 8) | d[55];
     if (last_tachometer >= 0) {
         int32_t delta = tachometer - last_tachometer;
         float revs = delta / (float)motor_pole_pairs;
@@ -84,5 +165,31 @@ bool vesc_uart_poll(vesc_data_t* data) {
         data->estimated_range_km = 0;
     }
 
+    ESP_LOGI(TAG, "V=%.1fV I=%.1fA Iin=%.1fA RPM=%d Speed=%.1f km/h Duty=%.1f%% SoC=%.1f%% Ah=%.2f Wh=%.2f Tmotor=%.1f°C",
+        data->voltage, data->current, data->input_current,
+        (int)data->rpm, data->speed_kmh, data->duty_cycle_percent,
+        data->battery_percentage, data->amp_hours, data->watt_hours, data->motor_temp);
+
     return true;
+}
+
+static int16_t read_int16(const uint8_t *data, int *index) {
+    int16_t value = ((int16_t)data[*index] << 8) | data[*index + 1];
+    *index += 2;
+    return value;
+}
+
+static uint16_t read_uint16(const uint8_t *data, int *index) {
+    uint16_t value = ((uint16_t)data[*index] << 8) | data[*index + 1];
+    *index += 2;
+    return value;
+}
+
+static int32_t read_int32(const uint8_t *data, int *index) {
+    int32_t value = ((int32_t)data[*index] << 24) |
+                    ((int32_t)data[*index + 1] << 16) |
+                    ((int32_t)data[*index + 2] << 8) |
+                    data[*index + 3];
+    *index += 4;
+    return value;
 }

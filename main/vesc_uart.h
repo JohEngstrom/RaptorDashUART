@@ -17,9 +17,19 @@ typedef struct {
     float distance_session_km;
     float distance_total_km;
     float estimated_range_km;
+    float input_current;
+    float duty_cycle_percent;
+    float motor_temp;
+    float amp_hours;
+    float amp_hours_charged;
+    float watt_hours;
+    float watt_hours_charged;
+    float charged_ah_total;
+    uint16_t charge_cycles;
 } vesc_data_t;
 
 void vesc_uart_init(int tx_pin, int rx_pin);
+bool vesc_read_packet(uint8_t *payload_out, size_t *payload_len);
 bool vesc_uart_poll(vesc_data_t* data);
 
 #endif

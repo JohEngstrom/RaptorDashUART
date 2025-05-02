@@ -1,4 +1,5 @@
 {
+  "C_Cpp.intelliSenseEngine": "default",
   "idf.customExtraVars": {
     "IDF_TARGET": "esp32s3"
   },

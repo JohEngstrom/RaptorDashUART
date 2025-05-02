@@ -1,0 +1,57 @@
+# ESP-IDF build output
+/build/
+/bootloader/
+/CMakeFiles/
+/cmake-build-*/  
+sdkconfig.old
+sdkconfig
+sdkconfig.defaults
+
+# Managed components
+managed_components/
+
+# Project-generated files
+*.bin
+*.elf
+*.map
+
+# Python virtual environments
+venv/
+.env/
+.venv/
+
+# Logs and core dumps
+*.log
+*.core
+
+# ESP-IDF-specific Python cache
+__pycache__/
+*.pyc
+
+# VS Code settings
+.vscode/*
+
+# But keep IntelliSense and launch/debug configurations
+!.vscode/c_cpp_properties.json
+!.vscode/launch.json
+!.vscode/tasks.json
+!.vscode/extensions.json
+
+# Eclipse settings
+.project
+.cproject
+.settings/
+
+# CLion/JetBrains IDEs
+.idea/
+cmake-build-*/
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# Backup and temporary files
+*~
+*.swp
+*.bak
+*.tmp
