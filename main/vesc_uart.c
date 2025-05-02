@@ -5,6 +5,7 @@
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "string.h"
+#include "freertos/semphr.h"
 
 #define UART_PORT UART_NUM_1
 #define BUF_SIZE 128
@@ -25,6 +26,27 @@ static float battery_wh = 960.0f;
 static int32_t last_tachometer = -1;
 static float session_km = 0;
 
+static vesc_data_t latest_data;
+static SemaphoreHandle_t data_mutex = NULL;
+
+void vesc_data_set(const vesc_data_t* src) {
+    if (data_mutex == NULL) return;
+    if (xSemaphoreTake(data_mutex, pdMS_TO_TICKS(10))) {
+        latest_data = *src;
+        xSemaphoreGive(data_mutex);
+    }
+}
+
+bool vesc_data_get(vesc_data_t* dst) {
+    if (data_mutex == NULL) return false;
+    if (xSemaphoreTake(data_mutex, pdMS_TO_TICKS(10))) {
+        *dst = latest_data;
+        xSemaphoreGive(data_mutex);
+        return true;
+    }
+    return false;
+}
+
 void vesc_uart_init(int tx_pin, int rx_pin) {
     uart_config_t uart_config = {
         .baud_rate = 115200,
@@ -37,11 +59,14 @@ void vesc_uart_init(int tx_pin, int rx_pin) {
     uart_driver_install(UART_PORT, BUF_SIZE * 2, 0, 0, NULL, 0);
     uart_param_config(UART_PORT, &uart_config);
     uart_set_pin(UART_PORT, tx_pin, rx_pin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+
+    if (data_mutex == NULL) {
+      data_mutex = xSemaphoreCreateMutex();
+    }
 }
 
 bool vesc_read_packet(uint8_t *payload_out, size_t *payload_len) {
     uint8_t buffer[128];
-    int total_read = 0;
 
     // Wait for start byte
     while (true) {
@@ -108,7 +133,7 @@ bool vesc_uart_poll(vesc_data_t* data) {
     i += 2 * 4; // skip current_in, pid_pos, id, iq
 
     int32_t tachometer = read_int32(payload, &i);
-    int32_t tachometer_abs = read_int32(payload, &i); // unused now
+    i += 4; // skip tachometer_abs
 
     int32_t wh_consumed = read_int32(payload, &i);
     int32_t wh_charged = read_int32(payload, &i);

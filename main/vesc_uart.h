@@ -29,6 +29,8 @@ typedef struct {
 } vesc_data_t;
 
 void vesc_uart_init(int tx_pin, int rx_pin);
+void vesc_data_set(const vesc_data_t* src);
+bool vesc_data_get(vesc_data_t* dst);
 bool vesc_read_packet(uint8_t *payload_out, size_t *payload_len);
 bool vesc_uart_poll(vesc_data_t* data);
 
