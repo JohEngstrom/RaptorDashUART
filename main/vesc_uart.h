@@ -3,6 +3,8 @@
 #define VESC_UART_H
 
 #include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
 
 typedef struct {
     float voltage;

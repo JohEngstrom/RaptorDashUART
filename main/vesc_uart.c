@@ -1,21 +1,15 @@
-
-#include "crc16.h"
-#include <math.h>
+// vesc_uart.c
 #include "vesc_uart.h"
 #include "driver/uart.h"
 #include "esp_log.h"
-#include "string.h"
-#include "freertos/semphr.h"
+#include <string.h>
+#include <math.h>
 
 #define UART_PORT UART_NUM_1
 #define BUF_SIZE 128
-#define POLL_INTERVAL 1000
+#define TAG "VESC_UART"
 
-static int16_t read_int16(const uint8_t *data, int *index);
-static uint16_t read_uint16(const uint8_t *data, int *index);
-static int32_t read_int32(const uint8_t *data, int *index);
-
-static const char *TAG = "VESC_UART";
+static vesc_data_t last_data;
 static float smoothed_watts = 0;
 static float peak_watts = 0;
 static float wheel_circum_mm = 890.0f;
@@ -26,25 +20,15 @@ static float battery_wh = 960.0f;
 static int32_t last_tachometer = -1;
 static float session_km = 0;
 
-static vesc_data_t latest_data;
-static SemaphoreHandle_t data_mutex = NULL;
-
-void vesc_data_set(const vesc_data_t* src) {
-    if (data_mutex == NULL) return;
-    if (xSemaphoreTake(data_mutex, pdMS_TO_TICKS(10))) {
-        latest_data = *src;
-        xSemaphoreGive(data_mutex);
+static uint16_t crc16(const uint8_t *data, uint16_t len) {
+    uint16_t crc = 0;
+    for (uint16_t i = 0; i < len; i++) {
+        crc ^= ((uint16_t)data[i]) << 8;
+        for (uint8_t j = 0; j < 8; j++) {
+            crc = (crc & 0x8000) ? (crc << 1) ^ 0x1021 : crc << 1;
+        }
     }
-}
-
-bool vesc_data_get(vesc_data_t* dst) {
-    if (data_mutex == NULL) return false;
-    if (xSemaphoreTake(data_mutex, pdMS_TO_TICKS(10))) {
-        *dst = latest_data;
-        xSemaphoreGive(data_mutex);
-        return true;
-    }
-    return false;
+    return crc;
 }
 
 void vesc_uart_init(int tx_pin, int rx_pin) {
@@ -55,113 +39,120 @@ void vesc_uart_init(int tx_pin, int rx_pin) {
         .stop_bits = UART_STOP_BITS_1,
         .flow_ctrl = UART_HW_FLOWCTRL_DISABLE
     };
-
     uart_driver_install(UART_PORT, BUF_SIZE * 2, 0, 0, NULL, 0);
     uart_param_config(UART_PORT, &uart_config);
     uart_set_pin(UART_PORT, tx_pin, rx_pin, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
-
-    if (data_mutex == NULL) {
-      data_mutex = xSemaphoreCreateMutex();
-    }
 }
 
-bool vesc_read_packet(uint8_t *payload_out, size_t *payload_len) {
-    uint8_t buffer[128];
-
-    // Wait for start byte
-    while (true) {
-        int read = uart_read_bytes(UART_PORT, buffer, 1, pdMS_TO_TICKS(100));
-        if (read == 1 && buffer[0] == 2) break;
-    }
-
-    // Read length
-    int read = uart_read_bytes(UART_PORT, buffer + 1, 1, pdMS_TO_TICKS(100));
-    if (read != 1) return false;
-    uint8_t len = buffer[1];
-
-    // Read payload + CRC (2 bytes) + end byte
-    int needed = len + 2 + 1;
-    read = uart_read_bytes(UART_PORT, buffer + 2, needed, pdMS_TO_TICKS(200));
-    if (read != needed) return false;
-
-    // Verify end byte
-    if (buffer[2 + len + 2] != 3) return false;
-
-    // Check CRC
-    uint16_t received_crc = ((uint16_t)buffer[2 + len] << 8) | buffer[2 + len + 1];
-    uint16_t computed_crc = crc16(buffer + 2, len);
-
-    if (received_crc != computed_crc) return false;
-
-    // Copy payload out
-    memcpy(payload_out, buffer + 2, len);
-    *payload_len = len;
-    return true;
+static float read_float16(const uint8_t *data, float scale, int *index) {
+    int16_t raw = ((int16_t)data[*index] << 8) | data[*index + 1];
+    *index += 2;
+    return raw / scale;
 }
 
-void vesc_send_command(uint8_t command) {
-    uint8_t payload[1] = {command};
-    uint16_t crc = crc16(payload, 1);
+static float read_float32(const uint8_t *data, float scale, int *index) {
+    int32_t raw = ((int32_t)data[*index] << 24) |
+                  ((int32_t)data[*index + 1] << 16) |
+                  ((int32_t)data[*index + 2] << 8) |
+                  data[*index + 3];
+    *index += 4;
+    return raw / scale;
+}
 
-    uint8_t packet[6];
-    packet[0] = 2;              // Start byte (short packet)
-    packet[1] = 1;              // Payload length
-    packet[2] = command;        // Payload: the command
-    packet[3] = (crc >> 8) & 0xFF;  // CRC High byte
-    packet[4] = crc & 0xFF;         // CRC Low byte
-    packet[5] = 3;              // End byte
+static int32_t read_int32(const uint8_t *data, int *index) {
+    int32_t val = ((int32_t)data[*index] << 24) |
+                  ((int32_t)data[*index + 1] << 16) |
+                  ((int32_t)data[*index + 2] << 8) |
+                  data[*index + 3];
+    *index += 4;
+    return val;
+}
+
+bool vesc_uart_poll(vesc_data_t *data) {
+    uint8_t cmd_payload[] = {
+        50,              // COMM_GET_VALUES_SELECTIVE
+        0xFF, 0xFF, 0xFF, 0xFF  // mask: request all fields
+    };
+
+    uint16_t crc = crc16(cmd_payload, sizeof(cmd_payload));
+
+    uint8_t packet[] = {
+        2, sizeof(cmd_payload),
+        cmd_payload[0], cmd_payload[1], cmd_payload[2], cmd_payload[3], cmd_payload[4],
+        (uint8_t)(crc >> 8), (uint8_t)(crc & 0xFF), 3
+    };
+
+    uart_flush(UART_PORT);
+
+    ESP_LOGI(TAG, "Sending UART packet:");
+    for (int k = 0; k < sizeof(packet); k++) {
+        printf("%02X ", packet[k]);
+    }
+    printf("\n");
 
     uart_write_bytes(UART_PORT, (const char *)packet, sizeof(packet));
-}
+    vTaskDelay(pdMS_TO_TICKS(20));
 
-bool vesc_uart_poll(vesc_data_t* data) {
-    vesc_send_command(4); // COMM_GET_VALUES
+    uint8_t buf[128];
+    int len = uart_read_bytes(UART_PORT, buf, sizeof(buf), pdMS_TO_TICKS(100));
+    if (len <= 0 || buf[0] != 2) {
+        ESP_LOGW(TAG, "Timeout or invalid start byte");
+        return false;
+    }
 
-    uint8_t payload[64];
-    size_t payload_len = 0;
-    if (!vesc_read_packet(payload, &payload_len)) return false;
+    int payload_len = buf[1];
+    if (payload_len + 5 > len) {
+        ESP_LOGW(TAG, "Incomplete packet");
+        return false;
+    }
 
-    int i = 0;
+    uint16_t received_crc = (buf[2 + payload_len] << 8) | buf[2 + payload_len + 1];
+    uint16_t computed_crc = crc16(&buf[2], payload_len);
 
-    int32_t erpm = read_int32(payload, &i);
-    int16_t motor_current = read_int16(payload, &i);
-    int16_t input_current = read_int16(payload, &i);
-    int16_t duty_cycle = read_int16(payload, &i);
-    uint16_t voltage_raw = read_uint16(payload, &i);
-    int16_t temp_fet = read_int16(payload, &i);
-    int16_t temp_motor = read_int16(payload, &i);
-    i += 2 * 4; // skip current_in, pid_pos, id, iq
+    if (received_crc != computed_crc || buf[2 + payload_len + 2] != 3) {
+        ESP_LOGW(TAG, "CRC or end byte error");
+        return false;
+    }
 
-    int32_t tachometer = read_int32(payload, &i);
-    i += 4; // skip tachometer_abs
+    const uint8_t *payload = &buf[2];
 
-    int32_t wh_consumed = read_int32(payload, &i);
-    int32_t wh_charged = read_int32(payload, &i);
-    int32_t ah_consumed = read_int32(payload, &i);
-    int32_t ah_charged = read_int32(payload, &i);
+    ESP_LOGI(TAG, "Received payload (len = %d):", payload_len);
+    for (int j = 0; j < payload_len; j++) {
+        printf("%02X ", payload[j]);
+    }
+    printf("\n");
 
-    uint16_t charge_cycles = read_uint16(payload, &i);
-    uint16_t charged_ah_total_raw = read_uint16(payload, &i);
+    if (payload_len < 40) {
+        ESP_LOGW(TAG, "Payload too short");
+        return false;
+    }
 
-    // Assign core values
-    data->current = motor_current / 10.0f;
-    data->input_current = input_current / 10.0f;
-    data->duty_cycle_percent = duty_cycle / 10.0f;
-    data->voltage = voltage_raw / 10.0f;
-    data->mosfet_temp = temp_fet / 10.0f;
-    data->motor_temp = temp_motor / 10.0f;
+    int i = 5; // Skip packet ID and 4-byte mask
+    data->mosfet_temp         = read_float16(payload, 10.0f, &i);
+    data->motor_temp          = read_float16(payload, 10.0f, &i);
+    data->current             = read_float32(payload, 100.0f, &i);
+    data->input_current       = read_float32(payload, 100.0f, &i);
+    read_float32(payload, 100.0f, &i); // skip id
+    read_float32(payload, 100.0f, &i); // skip iq
+    data->duty_cycle_percent  = read_float16(payload, 1000.0f, &i);
+    data->rpm                 = read_int32(payload, &i);
+    data->voltage             = read_float16(payload, 10.0f, &i);
+    data->amp_hours           = read_float32(payload, 10000.0f, &i);
+    data->amp_hours_charged   = read_float32(payload, 10000.0f, &i);
+    data->watt_hours          = read_float32(payload, 10000.0f, &i);
+    data->watt_hours_charged  = read_float32(payload, 10000.0f, &i);
+    int32_t tach              = read_int32(payload, &i);
+    int32_t tach_abs          = read_int32(payload, &i);
 
-    data->watt_hours = wh_consumed / 1000.0f;
-    data->watt_hours_charged = wh_charged / 1000.0f;
-    data->amp_hours = ah_consumed / 1000.0f;
-    data->amp_hours_charged = ah_charged / 1000.0f;
-    data->charge_cycles = charge_cycles;
-    data->charged_ah_total = charged_ah_total_raw / 100.0f;
+    data->charge_cycles = ((uint16_t)payload[i] << 8) | payload[i + 1];
+    i += 2;
+    data->charged_ah_total = (((uint16_t)payload[i] << 8) | payload[i + 1]) / 100.0f;
+    i += 2;
 
-    // Derived/calculated metrics
     float watts_now = data->voltage * data->current;
     smoothed_watts += (watts_now - smoothed_watts) / 5.0f;
     if (watts_now > peak_watts) peak_watts = watts_now;
+
     data->watts = watts_now;
     data->avg_watts = smoothed_watts;
     data->peak_watts = peak_watts;
@@ -169,19 +160,18 @@ bool vesc_uart_poll(vesc_data_t* data) {
     data->battery_percentage = 100.0f * (data->voltage - battery_min_v) / (battery_max_v - battery_min_v);
     data->battery_percentage = fmaxf(0, fminf(100, data->battery_percentage));
 
-    data->rpm = erpm / motor_pole_pairs;
-    data->speed_kmh = data->rpm * wheel_circum_mm * 60.0f / 1e6f;
+    float mech_rpm = data->rpm / (float)motor_pole_pairs;
+    data->speed_kmh = (mech_rpm * wheel_circum_mm * 60.0f) / 1e6f;
 
     if (last_tachometer >= 0) {
-        int32_t delta = tachometer - last_tachometer;
-        float revs = delta / (float)motor_pole_pairs;
-        session_km += (revs * wheel_circum_mm) / 1e6f;
+      int32_t delta = tach - last_tachometer;
+      float revs = delta / (float)motor_pole_pairs;
+      session_km += (revs * wheel_circum_mm) / 1e6f;
     }
-    last_tachometer = tachometer;
+    last_tachometer = tach;
 
     data->distance_session_km = session_km;
-    float total_revs = tachometer / (float)motor_pole_pairs;
-    data->distance_total_km = (total_revs * wheel_circum_mm) / 1e6f;
+    data->distance_total_km = (tach_abs / (float)motor_pole_pairs) * wheel_circum_mm / 1e6f;
 
     if (smoothed_watts > 1.0f) {
         float hours_left = battery_wh * (data->battery_percentage / 100.0f) / smoothed_watts;
@@ -190,31 +180,22 @@ bool vesc_uart_poll(vesc_data_t* data) {
         data->estimated_range_km = 0;
     }
 
-    ESP_LOGI(TAG, "V=%.1fV I=%.1fA Iin=%.1fA RPM=%d Speed=%.1f km/h Duty=%.1f%% SoC=%.1f%% Ah=%.2f Wh=%.2f Tmotor=%.1f°C",
-        data->voltage, data->current, data->input_current,
-        (int)data->rpm, data->speed_kmh, data->duty_cycle_percent,
-        data->battery_percentage, data->amp_hours, data->watt_hours, data->motor_temp);
-
+    last_data = *data;
     return true;
 }
 
-static int16_t read_int16(const uint8_t *data, int *index) {
-    int16_t value = ((int16_t)data[*index] << 8) | data[*index + 1];
-    *index += 2;
-    return value;
+void vesc_data_set(const vesc_data_t* src) {
+    last_data = *src;
 }
 
-static uint16_t read_uint16(const uint8_t *data, int *index) {
-    uint16_t value = ((uint16_t)data[*index] << 8) | data[*index + 1];
-    *index += 2;
-    return value;
+bool vesc_data_get(vesc_data_t* dst) {
+    if (dst) {
+        *dst = last_data;
+        return true;
+    }
+    return false;
 }
 
-static int32_t read_int32(const uint8_t *data, int *index) {
-    int32_t value = ((int32_t)data[*index] << 24) |
-                    ((int32_t)data[*index + 1] << 16) |
-                    ((int32_t)data[*index + 2] << 8) |
-                    data[*index + 3];
-    *index += 4;
-    return value;
+bool vesc_read_packet(uint8_t *payload_out, size_t *payload_len) {
+    return false;
 }
