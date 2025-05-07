@@ -2,6 +2,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "vesc_uart.h"
+#include "vesc_uart_write.h"
 #include "esp_log.h"
 
 #define VESC_TX 43
