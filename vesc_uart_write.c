@@ -1,6 +1,6 @@
 #include "vesc_uart_write.h"
 #include "uart_platform.h"
-#include "crc.h"
+#include "crc16.h"
 
 #define COMM_SELECT_PROFILE 0x4F
 

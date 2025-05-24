@@ -5,4 +5,5 @@ idf_component_register(
          "vesc_uart.c"
          "vesc_uart_write.c"
     INCLUDE_DIRS "."
+    REQUIRES driver
 )
